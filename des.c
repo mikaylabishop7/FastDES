@@ -85,26 +85,53 @@ static const uint8_t SBOX4[256] = {
     0xD4,0x7B,0x16,0xA9,0x50,0xCE,0x24,0x8D,0xF0,0x39,0x65,0xB2,0x1F,0xE7,0x48,0x93
 };
 
+static void trim_newline(char *s);
+static int is_valid_hex_string(const char *s);
+static int read_line(const char *prompt, char *buffer, size_t size);
+static int parse_hex64(const char *s, uint64_t *value);
+static char *pad_left_to_block_multiple(const char *hex);
+static int process_hex_string_blocks(const char *input_hex, uint64_t key, int encrypt_mode, char *output_hex, size_t output_size);
+
+static uint32_t rotl32(uint32_t x, int n);
+static uint64_t rotl56(uint64_t x, int n);
+static uint32_t permute32(uint32_t x);
+static uint32_t compress56to32(uint64_t key56);
+static uint32_t feistel_f(uint32_t right, uint32_t round_key);
+static void generate_round_keys(uint64_t master_key, uint32_t round_keys[NUM_ROUNDS]);
+
 static uint32_t rotl32(uint32_t x, int n) {
+    n &= 31;
+    if (n == 0) return x;
     return (x << n) | (x >> (32 - n));
 }
 
 static uint64_t rotl56(uint64_t x, int n) {
+    n %= 56;
     x &= KEY_MASK_56;
+    if (n == 0) return x;
     return ((x << n) | (x >> (56 - n))) & KEY_MASK_56;
 }
 
 static uint32_t permute32(uint32_t x) {
-    return rotl32(x, 3) ^ rotl32(x, 11) ^ rotl32(x, 19);
+    return x ^ rotl32(x, 7) ^ rotl32(x, 17);
+}
+
+static uint32_t compress56to32(uint64_t key56) {
+    key56 &= KEY_MASK_56;
+
+    uint32_t low  = (uint32_t)(key56 & 0xFFFFFFFFU);
+    uint32_t high = (uint32_t)((key56 >> 24) & 0xFFFFFFFFU);
+
+    return low ^ rotl32(high, 5) ^ rotl32(low, 13) ^ rotl32(high, 21);
 }
 
 static uint32_t feistel_f(uint32_t right, uint32_t round_key) {
     uint32_t x = right ^ round_key;
 
-    uint8_t b0 = (x >> 24) & 0xFF;
-    uint8_t b1 = (x >> 16) & 0xFF;
-    uint8_t b2 = (x >> 8)  & 0xFF;
-    uint8_t b3 = x & 0xFF;
+    uint8_t b0 = (uint8_t)((x >> 24) & 0xFF);
+    uint8_t b1 = (uint8_t)((x >> 16) & 0xFF);
+    uint8_t b2 = (uint8_t)((x >> 8)  & 0xFF);
+    uint8_t b3 = (uint8_t)(x & 0xFF);
 
     uint32_t y = 0;
     y |= ((uint32_t)SBOX1[b0]) << 24;
@@ -116,12 +143,13 @@ static uint32_t feistel_f(uint32_t right, uint32_t round_key) {
 }
 
 static void generate_round_keys(uint64_t master_key, uint32_t round_keys[NUM_ROUNDS]) {
-    int shifts[NUM_ROUNDS] = {1, 2, 1, 2, 1, 2, 1, 2};
+    static const int shifts[NUM_ROUNDS] = {1, 1, 2, 2, 2, 2, 2, 2};
     uint64_t key = master_key & KEY_MASK_56;
 
     for (int i = 0; i < NUM_ROUNDS; i++) {
         key = rotl56(key, shifts[i]);
-        round_keys[i] = (uint32_t)((key >> 24) & 0xFFFFFFFFU);
+        round_keys[i] = compress56to32(key);
+        round_keys[i] ^= rotl32(round_keys[i], (i + 3) % 32);
     }
 }
 
@@ -168,6 +196,7 @@ static void trim_newline(char *s) {
 
 static int is_valid_hex_string(const char *s) {
     if (*s == '\0') return 0;
+
     while (*s) {
         if (!isxdigit((unsigned char)*s)) {
             return 0;
@@ -219,15 +248,15 @@ static char *pad_left_to_block_multiple(const char *hex) {
     for (size_t i = 0; i < pad; i++) {
         result[i] = '0';
     }
+
     memcpy(result + pad, hex, len);
     result[padded_len] = '\0';
-
     return result;
 }
 
 static int process_hex_string_blocks(const char *input_hex, uint64_t key, int encrypt_mode, char *output_hex, size_t output_size) {
     char *padded = NULL;
-    size_t len, blocks;
+    size_t len, blocks, needed;
 
     if (!is_valid_hex_string(input_hex)) {
         return 0;
@@ -240,8 +269,9 @@ static int process_hex_string_blocks(const char *input_hex, uint64_t key, int en
 
     len = strlen(padded);
     blocks = len / 16;
+    needed = blocks * 16 + 1;
 
-    if (output_size < len + 1) {
+    if (output_size < needed) {
         free(padded);
         return 0;
     }
@@ -252,6 +282,7 @@ static int process_hex_string_blocks(const char *input_hex, uint64_t key, int en
         char block_str[17];
         uint64_t block_value;
         uint64_t result;
+        char temp[17];
 
         memcpy(block_str, padded + (i * 16), 16);
         block_str[16] = '\0';
@@ -267,7 +298,6 @@ static int process_hex_string_blocks(const char *input_hex, uint64_t key, int en
             result = fastdes_decrypt(block_value, key);
         }
 
-        char temp[17];
         snprintf(temp, sizeof(temp), "%016" PRIX64, result);
         strcat(output_hex, temp);
     }
